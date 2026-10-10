@@ -1,0 +1,18 @@
+# GithubPatches
+*.iml
+# signing keys and their passwords (never commit)
+*.jks
+*.keystore
+*.p12
+.env
+.DS_Store
+.gradle/
+.idea/
+.kotlin/
+app/src/main/assets/webui/
+build/
+keystore.properties
+local.properties
+node_modules/
+webui/dist/
+webui/tsconfig.tsbuildinfo
