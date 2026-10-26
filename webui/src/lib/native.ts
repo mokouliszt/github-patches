@@ -30,6 +30,8 @@ export interface PatchEntry {
   deletions: number;
   meta: boolean;
   pushes: PushRecord[];
+  /** Files the last push left out (pushed by 1.0.0, which could not read some hunks). */
+  missed?: number;
 }
 
 /** [kind, old line, new line, text, no newline at end] — 0 means "no number". */
@@ -54,6 +56,8 @@ export interface DiffFile {
   truncated: boolean;
   encoding?: string;
   hunks: DiffHunk[];
+  /** Hunks of this file the last push left out. */
+  missed?: number;
 }
 
 export interface DiffCommit {
@@ -75,7 +79,7 @@ export interface PatchDetail extends PatchEntry {
 
 export interface Repo { fullName: string; owner: string; name: string; private: boolean; fork: boolean; defaultBranch: string; pushedAt: string }
 export interface Branch { name: string; protected: boolean }
-export interface Target { repo: string; branch: string; create: boolean; base: string }
+export interface Target { repo: string; branch: string; create: boolean; base: string; onlyMissed?: boolean }
 export interface Recent { repo: string; branch: string }
 
 export type Outcome = "ok" | "offset" | "loose" | "fail";
@@ -151,7 +155,7 @@ export const native = {
   pickFile: (reqId: string) => N().pickFile(reqId),
   importClipboard: (reqId: string) => N().importClipboard(reqId),
   importUrl: (reqId: string, url: string) => N().importUrl(reqId, url),
-  patch: (id: string): PatchDetail | null => {
+  patch: (id: string): PatchDetail | { error: string } | null => {
     const s: string = N().patch(id);
     return s ? JSON.parse(s) : null;
   },
@@ -159,8 +163,9 @@ export const native = {
   repos: (reqId: string, force: boolean) => N().repos(reqId, force),
   branches: (reqId: string, repo: string) => N().branches(reqId, repo),
   check: (reqId: string, id: string, target: Target) => N().check(reqId, id, JSON.stringify(target)),
-  push: (reqId: string, id: string, target: Target, messages: string[], squash: boolean) =>
-    N().push(reqId, id, JSON.stringify(target), JSON.stringify(messages), squash),
+  /** [checkedHead]: the tip the shown check ran on. */
+  push: (reqId: string, id: string, target: Target, messages: string[], squash: boolean, checkedHead: string) =>
+    N().push(reqId, id, JSON.stringify(target), JSON.stringify(messages), squash, checkedHead),
   cancel: (reqId: string) => N().cancel(reqId),
   openUrl: (url: string) => N().openUrl(url),
   copy: (text: string) => N().copy(text),
@@ -269,6 +274,7 @@ const files2: DiffFile[] = [{
 const files3: DiffFile[] = [{
   commit: 0, path: "webui/src/components/SettingsSheet.tsx", oldPath: "webui/src/components/SettingsSheet.tsx", status: "modified",
   oldMode: "", newMode: "", additions: 3, deletions: 3, binary: false, binarySize: -1, submodule: false, truncated: false,
+  ...(flag("missed") ? { missed: 1 } : {}),
   hunks: [{
     header: "@@ -120,7 +120,7 @@", section: "export function SettingsSheet({",
     lines: [
@@ -297,6 +303,7 @@ const mockPatches: PatchEntry[] = [
   entry({ id: "p2", name: "fix-readme.patch", title: "fix-readme", importedAt: now - 3 * 3600e3, source: "file", additions: 2, deletions: 1, meta: false }),
   entry({
     id: "p3", name: "0001-settings-spacing.patch", title: "設定画面の余白を調整", importedAt: now - 2 * 86400e3, additions: 3, deletions: 3,
+    ...(flag("missed") ? { missed: 1 } : {}),
     pushes: [{
       repo: "octocat/hello-world", branch: "main", head: "9f2c4e1a7b", commits: ["9f2c4e1a7b"], created: false, base: "",
       url: "https://github.com/octocat/hello-world/commit/9f2c4e1a7b", commitUrl: "https://github.com/octocat/hello-world/commit/9f2c4e1a7b",

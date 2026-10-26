@@ -416,6 +416,8 @@ class GitHub(context: Context) {
 
         override suspend fun tree(sha: String): List<TreeItem> {
             val o = call("GET", "$base/git/trees/$sha") { json(it) }
+            // A cut-off listing would make existing files look missing.
+            if (o.optBoolean("truncated")) throw RemoteException(Kind.OTHER, "tree $sha is too large to list")
             val arr = o.optJSONArray("tree") ?: JSONArray()
             return (0 until arr.length()).mapNotNull { i ->
                 val e = arr.optJSONObject(i) ?: return@mapNotNull null

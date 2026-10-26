@@ -31,7 +31,19 @@ object PatchJson {
             .put("meta", p.hasMetadata)
     }
 
+    /**
+     * Files whose changes the entry's last push left out because 1.0.0 could not read some hunk
+     * headers (see [FileDiff.droppedBy100]). Pushes since then carry the app version ("v").
+     */
+    fun missed(entry: JSONObject, p: PatchSet): List<FileDiff> {
+        val pushes = entry.optJSONArray("pushes") ?: return emptyList()
+        val last = pushes.optJSONObject(pushes.length() - 1) ?: return emptyList()
+        if (last.has("v")) return emptyList()
+        return p.files.filter { it.droppedBy100 > 0 }
+    }
+
     fun detail(entry: JSONObject, p: PatchSet): JSONObject {
+        val missed = missed(entry, p).toSet()
         val commits = JSONArray()
         val files = JSONArray()
         var budget = MAX_LINES
@@ -42,7 +54,7 @@ object PatchJson {
                 val lines = f.hunks.sumOf { it.lines.size }
                 val show = lines <= budget
                 if (show) budget -= lines
-                files.put(file(ci, f, show))
+                files.put(file(ci, f, show).apply { if (f in missed) put("missed", f.droppedBy100) })
             }
             commits.put(JSONObject()
                 .put("sha", c.sha ?: "")

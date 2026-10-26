@@ -24,6 +24,8 @@ export default function App() {
   const [openId, setOpenId] = React.useState<string | null>(initial.open || null);
   const [detail, setDetail] = React.useState<PatchDetail | null>(null);
   const [sheet, setSheet] = React.useState<SheetName>(null);
+  /** The push sheet sends only what 1.0.0 left out of the last push. */
+  const [pushMissed, setPushMissed] = React.useState(false);
   const [pushView, setPushView] = React.useState<PushView>("main");
   const [importBusy, setImportBusy] = React.useState<ImportKind | null>(null);
   const [deviceCode, setDeviceCode] = React.useState<DeviceCode | null>(null);
@@ -67,9 +69,10 @@ export default function App() {
   React.useEffect(() => {
     if (!openId) { setDetail(null); return; }
     const d = native.patch(openId);
-    if (d) setDetail(d);
-    else setOpenId(null);
-  }, [openId]);
+    if (d && !("error" in d)) { setDetail(d); return; }
+    if (d) toast(d.error);
+    setOpenId(null);
+  }, [openId, toast]);
 
   // ------------------------------------------------------------ native events
   React.useEffect(() => {
@@ -88,10 +91,16 @@ export default function App() {
         setOpenId(p.entry.id);
       }),
       on("repos", (p) => setRepos(p.repos)),
+      on("patches", (p) => setPatches(p.patches)),
       on("pushed", (p) => {
         setPatches(p.patches);
         setRecent(p.recent);
-        setDetail((d) => (d && p.entry && d.id === p.entry.id ? { ...d, pushes: p.entry.pushes } : d));
+        // Reload: a push can clear what an older version left out.
+        setDetail((d) => {
+          if (!d || !p.entry || d.id !== p.entry.id) return d;
+          const fresh = native.patch(d.id);
+          return fresh && !("error" in fresh) ? fresh : { ...d, pushes: p.entry.pushes };
+        });
       }),
       on("error", (p) => {
         const id: string = p.reqId || "";
@@ -203,7 +212,8 @@ export default function App() {
             wrap={settings.wrap}
             onWrap={() => changeSettings({ wrap: !settings.wrap })}
             onBack={() => setOpenId(null)}
-            onPush={() => { setPushView("main"); setSheet("push"); }}
+            onPush={() => { setPushMissed(false); setPushView("main"); setSheet("push"); }}
+            onPushMissed={() => { setPushMissed(true); setPushView("main"); setSheet("push"); }}
             onDelete={() => setSheet("delete")}
             onOpenUrl={native.openUrl}
           />
@@ -224,6 +234,7 @@ export default function App() {
           view={pushView}
           setView={setPushView}
           patch={detail}
+          onlyMissed={pushMissed}
           repos={repos}
           reposLoading={reposLoading}
           recent={recent}

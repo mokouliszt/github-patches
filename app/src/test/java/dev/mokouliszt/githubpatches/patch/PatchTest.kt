@@ -313,6 +313,107 @@ class PatchTest {
         assertEquals(repo.tree(c), repo.tree("cptarget"))
     }
 
+    /** Same line counts, different text: only the index line can tell. */
+    @Test
+    fun contentThatDisagreesWithItsIndexLineIsRejected() {
+        val raw = String(formatPatch("$base..$c1", "README.md"), Charsets.ISO_8859_1)
+            .replace("+readme line 3 changed\n", "+readme line 3 chang3d\n")
+        val patch = PatchParser.parse(raw.toByteArray(Charsets.ISO_8859_1))
+        repo.git("branch", "tampered", base)
+        val report = check(patch, PushTarget("tampered", create = false))
+        assertEquals(FailReason.CORRUPT, report.files.single().reason)
+        // On a base the patch was not made from there is nothing to compare, so it applies as usual.
+        repo.git("checkout", "-q", "-b", "moved", base)
+        repo.write("other.txt", "x\n")
+        repo.commitAll("unrelated")
+        repo.write("README.md", lines("readme", 40).replace("readme line 39\n", "edited 39\n"))
+        repo.commitAll("edit elsewhere")
+        assertTrue(check(patch, PushTarget("moved", create = false)).ok)
+    }
+
+    @Test
+    fun addedFileMustMatchItsIndexLine() {
+        val raw = String(formatPatch("$base..$c1", "new/dir/added.txt"), Charsets.ISO_8859_1).replace("+brand new\n", "+brand neW\n")
+        repo.git("branch", "added", base)
+        val report = check(PatchParser.parse(raw.toByteArray(Charsets.ISO_8859_1)), PushTarget("added", create = false))
+        assertEquals(FailReason.CORRUPT, report.files.single().reason)
+    }
+
+    @Test
+    fun downloadedContentIsVerified() {
+        val local = LocalRemote(repo)
+        val remote = object : GitRemote by local {
+            override suspend fun blob(sha: String): ByteArray = local.blob(sha).also { it[0] = (it[0] + 1).toByte() }
+        }
+        val patch = PatchParser.parse(formatPatch("$base..$c1"))
+        repo.git("branch", "flaky", base)
+        val e = runCatching { runBlocking { Pusher(remote).check(patch, PushTarget("flaky", create = false)) } }.exceptionOrNull()
+        assertTrue(e is PushException && e.kind == PushException.Kind.INTEGRITY)
+    }
+
+    @Test
+    fun branchThatMovedAfterTheCheckIsCheckedAgain() {
+        repo.git("branch", "moving", base)
+        val patch = PatchParser.parse(formatPatch("$base..$c1", "README.md"))
+        val checked = check(patch, PushTarget("moving", create = false))
+        assertTrue(checked.files.all { it.outcome == Outcome.OK })
+        // Someone adds a line at the top: the patch now applies only with an offset.
+        repo.git("checkout", "-q", "moving")
+        repo.write("README.md", "new first line\n" + lines("readme", 40))
+        repo.commitAll("prepend")
+        val before = repo.git("rev-parse", "moving")
+        fun pushOn(head: String) = runBlocking {
+            Pusher(LocalRemote(repo)).push(patch, PushTarget("moving", create = false), patch.commits.map { it.message }, false, true, head)
+        }
+        val e = runCatching { pushOn(checked.head) }.exceptionOrNull() as? PushException
+        assertEquals(PushException.Kind.BRANCH_MOVED, e?.kind)
+        assertEquals(Outcome.OFFSET, e!!.report!!.files.single().outcome)
+        assertEquals(before, repo.git("rev-parse", "moving"))
+        // Pushing after the new check goes through.
+        pushOn(e.report!!.head)
+        assertTrue(repo.git("show", "moving:README.md").contains("readme line 3 changed"))
+    }
+
+    /**
+     * What 1.0.0 pushed for a patch: every file without the hunks it could not read. The index lines
+     * are left out, since 1.0.1 would refuse a result that differs from them (as it should).
+     */
+    private fun as100(p: PatchSet) = PatchSet(p.commits.map { c ->
+        PatchCommit(c.sha, c.authorName, c.authorEmail, c.date, c.subject, c.body, c.files.map { f ->
+            FileDiff(f.oldPath, f.newPath, f.status, f.oldMode, f.newMode, f.similarity, null, null,
+                f.hunks.dropLast(f.droppedBy100), f.binary, f.binaryWithoutData, f.submodule)
+        })
+    })
+
+    @Test
+    fun whatTheOldVersionLeftOutCanBePushedAfterwards() {
+        repo.git("checkout", "-q", "-b", "ja", base)
+        val doc = "# タイトル\nAndroid端末から公開するアプリです。\n" + (3..40).joinToString("") { "- 項目 $it\n" }
+        repo.write("docs/README.ja.md", doc)
+        val before = repo.commitAll("doc")
+        repo.write("docs/README.ja.md", doc.replace("- 項目 3\n", "- 項目 3\n- 追加\n").replace("- 項目 30\n", "- 変更 30\n").replace("- 項目 38\n", "- 変更 38\n"))
+        val after = repo.commitAll("edit doc")
+        val patch = PatchParser.parse(formatPatch("$before..$after"))
+        val f = patch.files.single()
+        assertEquals(3, f.hunks.size)
+        assertEquals(2, f.droppedBy100)
+
+        repo.git("branch", "pushed100", before)
+        // With its index lines, the incomplete patch no longer gets through.
+        val incomplete = PatchSet(listOf(PatchCommit(null, null, null, null, "", "", listOf(
+            FileDiff(f.oldPath, f.newPath, f.status, f.oldMode, f.newMode, f.similarity, f.oldIndex, f.newIndex,
+                f.hunks.dropLast(f.droppedBy100), null, false, false)))))
+        assertEquals(FailReason.CORRUPT, check(incomplete, PushTarget("pushed100", create = false)).files.single().reason)
+        push(as100(patch), PushTarget("pushed100", create = false))
+        assertFalse(repo.git("show", "pushed100:docs/README.ja.md").contains("変更 30"))
+
+        val missed = patch.droppedBy100()
+        val report = check(missed, PushTarget("pushed100", create = false))
+        assertTrue(report.files.joinToString { "${it.outcome}" }, report.files.all { it.outcome == Outcome.OK })
+        push(missed, PushTarget("pushed100", create = false), squash = true)
+        assertEquals(repo.tree(after), repo.tree("pushed100"))
+    }
+
     @Test
     fun rejectsNonPatch() {
         val e = runCatching { PatchParser.parse("hello\nworld\n".toByteArray()) }.exceptionOrNull()

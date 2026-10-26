@@ -110,6 +110,24 @@ class Store(context: Context) {
         File(patchDir, "$id.patch").delete()
     }
 
+    /**
+     * Runs [update] over every entry with its raw patch, once per app [version], so that counts
+     * worked out by an older parser are replaced. Returns false when this version already did it.
+     */
+    fun refreshEntries(version: String, update: (JSONObject, ByteArray) -> Unit): Boolean = synchronized(lock) {
+        val marker = File(patchDir, "entries.version")
+        if (marker.isFile && marker.readText() == version) return false
+        val a = index()
+        for (i in 0 until a.length()) {
+            val e = a.getJSONObject(i)
+            val raw = raw(e.optString("id")) ?: continue
+            runCatching { update(e, raw) }
+        }
+        saveIndex(a)
+        marker.writeText(version)
+        true
+    }
+
     fun addPush(id: String, push: JSONObject): JSONObject? = synchronized(lock) {
         val a = index()
         var updated: JSONObject? = null
@@ -119,6 +137,7 @@ class Store(context: Context) {
                 val pushes = e.optJSONArray("pushes") ?: JSONArray()
                 pushes.put(push)
                 e.put("pushes", pushes)
+                e.remove("missed")
                 updated = e
             }
         }

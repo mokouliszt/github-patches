@@ -26,6 +26,7 @@ export function PushSheet({
   view,
   setView,
   patch,
+  onlyMissed,
   repos,
   reposLoading,
   recent,
@@ -37,6 +38,8 @@ export function PushSheet({
   view: PushView;
   setView: (v: PushView) => void;
   patch: PatchDetail | null;
+  /** Only the hunks 1.0.0 left out of the last push, as one commit. */
+  onlyMissed: boolean;
   repos: { at: number; items: Repo[] };
   reposLoading: boolean;
   recent: Recent[];
@@ -64,7 +67,14 @@ export function PushSheet({
   const pushReq = React.useRef<string | null>(null);
   const branchReqs = React.useRef(new Map<string, string>());
 
-  const commits = patch?.detail.commits ?? [];
+  const allCommits = patch?.detail.commits ?? [];
+  // Left-out hunks go up as one commit, under the messages of the commits they came from.
+  const commits = onlyMissed && patch
+    ? allCommits.filter((c) => c.files.some((fi) => patch.detail.files[fi]?.missed)).slice(0, 1)
+    : allCommits;
+  const missedMessage = onlyMissed && patch
+    ? allCommits.filter((c) => c.files.some((fi) => patch.detail.files[fi]?.missed)).map((c) => c.message).filter(Boolean).join("\n\n")
+    : "";
   const repoByName = React.useMemo(() => new Map(repos.items.map((r) => [r.fullName, r])), [repos.items]);
 
   const loadBranches = React.useCallback((repo: string) => {
@@ -82,7 +92,7 @@ export function PushSheet({
     setPushError("");
     setSquash(false);
     setQuery("");
-    setMessages(patch.detail.commits.map((c) => c.message));
+    setMessages(onlyMissed ? [missedMessage] : patch.detail.commits.map((c) => c.message));
     setSquashMessage(patch.detail.commits.map((c) => c.message).filter(Boolean).join("\n\n"));
     const last = patch.pushes[patch.pushes.length - 1];
     let initial: Target | null = null;
@@ -93,7 +103,7 @@ export function PushSheet({
     if (initial) loadBranches(initial.repo);
     if (!repos.items.length || Date.now() - repos.at > REPOS_STALE_MS) onLoadRepos(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, patch?.id]);
+  }, [open, patch?.id, onlyMissed]);
 
   // A patch fetched from a GitHub URL targets that repository once the list has loaded.
   React.useEffect(() => {
@@ -119,9 +129,9 @@ export function PushSheet({
     checkReq.current = id;
     setCheck({ s: "running" });
     setPushError("");
-    native.check(id, patch.id, target);
+    native.check(id, patch.id, { ...target, onlyMissed });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, patch?.id, targetKey]);
+  }, [open, patch?.id, targetKey, onlyMissed]);
 
   // ------------------------------------------------------------ native events
   React.useEffect(() => {
@@ -173,7 +183,7 @@ export function PushSheet({
     pushReq.current = id;
     setPushing(true);
     setPushError("");
-    native.push(id, patch.id, target, finalMessages, squash && commits.length > 1);
+    native.push(id, patch.id, { ...target, onlyMissed }, finalMessages, onlyMissed || (squash && commits.length > 1), report?.head ?? "");
   };
 
   const chooseRepo = (r: Repo) => {
@@ -219,7 +229,7 @@ export function PushSheet({
   }
 
   return (
-    <Sheet open={open} onOpenChange={onOpenChange} title={view === "main" ? "Push" : undefined} footer={footer}>
+    <Sheet open={open} onOpenChange={onOpenChange} title={view === "main" ? (onlyMissed ? t("pushMissed") : "Push") : undefined} footer={footer}>
       {view === "main" && (
         <div className="pt-1">
           <div className="divide-y divide-line overflow-hidden rounded-2xl border border-line bg-card">

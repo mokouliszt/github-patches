@@ -1,5 +1,5 @@
 import * as React from "react";
-import { ArrowUp, Check, ChevronLeft, ChevronRight, CircleSlash, ExternalLink, GitPullRequest, Trash2, WrapText } from "lucide-react";
+import { ArrowUp, Check, ChevronLeft, ChevronRight, CircleSlash, ExternalLink, GitPullRequest, Trash2, TriangleAlert, WrapText } from "lucide-react";
 import type { DiffCommit, DiffFile, PatchDetail, PushRecord, Row } from "@/lib/native";
 import { useI18n, type Key } from "@/lib/i18n";
 import { ago, cn, date, size, splitPath } from "@/lib/utils";
@@ -15,6 +15,7 @@ export function PatchView({
   onWrap,
   onBack,
   onPush,
+  onPushMissed,
   onDelete,
   onOpenUrl,
 }: {
@@ -23,6 +24,7 @@ export function PatchView({
   onWrap: () => void;
   onBack: () => void;
   onPush: () => void;
+  onPushMissed: () => void;
   onDelete: () => void;
   onOpenUrl: (url: string) => void;
 }) {
@@ -67,7 +69,9 @@ export function PatchView({
       </div>
 
       <div className="px-4 pt-1" style={{ paddingBottom: "calc(var(--sab) + 96px)" }}>
-        {last && <Pushed push={last} onOpenUrl={onOpenUrl} />}
+        {last && (
+          <Pushed push={last} missed={files.filter((f) => f.missed).map((f) => splitPath(f.path).base)} onOpenUrl={onOpenUrl} onPushMissed={onPushMissed} />
+        )}
         {commits.map((c, i) => (
           <section key={i} className="mb-6">
             <CommitHead commit={c} index={i} total={commits.length} multi={multi} files={c.files.length} headingRef={i === 0 ? heading : undefined} />
@@ -89,18 +93,25 @@ export function PatchView({
   );
 }
 
-function Pushed({ push, onOpenUrl }: { push: PushRecord; onOpenUrl: (u: string) => void }) {
+function Pushed({ push, missed, onOpenUrl, onPushMissed }: {
+  push: PushRecord; missed: string[]; onOpenUrl: (u: string) => void; onPushMissed: () => void;
+}) {
   const { t } = useI18n();
   return (
-    <button
-      onClick={() => onOpenUrl(push.url)}
-      className="mb-4 flex w-full items-center gap-2 rounded-xl border border-line bg-card px-3.5 py-2.5 text-left text-[13px] active:bg-subtle"
-    >
-      <Check className="h-4 w-4 shrink-0" />
-      <span className="min-w-0 flex-1 truncate">{push.repo} · {push.branch}</span>
-      <span className="shrink-0 text-[12px] text-muted">{ago(push.at, t)}</span>
-      {push.created ? <GitPullRequest className="h-3.5 w-3.5 shrink-0 text-muted" /> : <ExternalLink className="h-3.5 w-3.5 shrink-0 text-muted" />}
-    </button>
+    <div className="mb-4 overflow-hidden rounded-xl border border-line bg-card text-[13px]">
+      <button onClick={() => onOpenUrl(push.url)} className="flex w-full items-center gap-2 px-3.5 py-2.5 text-left active:bg-subtle">
+        {missed.length ? <TriangleAlert className="h-4 w-4 shrink-0 text-del" /> : <Check className="h-4 w-4 shrink-0" />}
+        <span className="min-w-0 flex-1 truncate">{push.repo} · {push.branch}</span>
+        <span className="shrink-0 text-[12px] text-muted">{ago(push.at, t)}</span>
+        {push.created ? <GitPullRequest className="h-3.5 w-3.5 shrink-0 text-muted" /> : <ExternalLink className="h-3.5 w-3.5 shrink-0 text-muted" />}
+      </button>
+      {missed.length > 0 && (
+        <div className="flex items-center gap-3 border-t border-line py-2 pl-[38px] pr-2">
+          <span className="min-w-0 flex-1 text-[12.5px] leading-snug text-del">{t("notPushed", { files: [...new Set(missed)].join(", ") })}</span>
+          <Button size="sm" onClick={onPushMissed}><ArrowUp className="h-3.5 w-3.5" /> Push</Button>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -155,6 +166,7 @@ const FileCard = React.memo(function FileCard({ file, wrap, defaultOpen }: { fil
           </div>
           {moved && <div className="mt-0.5 truncate text-[11.5px] text-muted">{file.oldPath} →</div>}
         </div>
+        {file.missed ? <span className="shrink-0 rounded-md bg-del-bg px-1.5 py-[2px] text-[11px] text-del">{t("missed")}</span> : null}
         {status && <span className="shrink-0 rounded-md bg-subtle px-1.5 py-[2px] text-[11px] text-muted">{t(status)}</span>}
         {file.additions + file.deletions > 0 && (
           <span className="shrink-0 text-[12px]">

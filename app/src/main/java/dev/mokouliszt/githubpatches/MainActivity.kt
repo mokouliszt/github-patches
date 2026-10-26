@@ -27,8 +27,10 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.webkit.WebSettingsCompat
 import androidx.webkit.WebViewAssetLoader
 import androidx.webkit.WebViewFeature
+import dev.mokouliszt.githubpatches.patch.PatchCountException
 import dev.mokouliszt.githubpatches.patch.PatchFormatException
 import dev.mokouliszt.githubpatches.patch.PatchParser
+import dev.mokouliszt.githubpatches.patch.PatchSet
 import dev.mokouliszt.githubpatches.patch.PushException
 import dev.mokouliszt.githubpatches.patch.PushTarget
 import dev.mokouliszt.githubpatches.patch.Pusher
@@ -86,6 +88,16 @@ class MainActivity : ComponentActivity() {
 
         store = Store(this)
         github = GitHub(this)
+        appScope.launch(Dispatchers.Default) {
+            val changed = store.refreshEntries(BuildConfig.VERSION_NAME) { e, raw ->
+                val p = PatchParser.parse(raw)
+                val s = PatchJson.summary(p, e.optString("name"))
+                s.keys().forEach { k -> e.put(k, s.get(k)) }
+                val missed = PatchJson.missed(e, p).size
+                if (missed > 0) e.put("missed", missed) else e.remove("missed")
+            }
+            if (changed) emit("patches", JSONObject().put("patches", store.index()))
+        }
         I18n.lang = store.lang()
         pageReady = false
 
@@ -204,12 +216,13 @@ class MainActivity : ComponentActivity() {
         if (t is CancellationException) return
         val (kind, message) = when (t) {
             is GitHubException -> (if (t.needLogin) "login" else "github") to (t.message ?: "")
-            is PatchFormatException -> "format" to I18n.t("パッチとして読み込めませんでした", "This is not a patch")
+            is PatchFormatException -> "format" to formatMessage(t)
             is PushException -> when (t.kind) {
                 PushException.Kind.BRANCH_MISSING -> "branchMissing" to I18n.t("ブランチ ${t.detail} が見つかりません", "Branch ${t.detail} not found")
                 PushException.Kind.BRANCH_EXISTS -> "branchExists" to I18n.t("ブランチ ${t.detail} はすでにあります", "Branch ${t.detail} already exists")
                 PushException.Kind.DOES_NOT_APPLY -> "conflict" to I18n.t("適用できないファイルがあります", "Some files do not apply")
-                PushException.Kind.INTEGRITY -> "integrity" to I18n.t("アップロードした内容が一致しませんでした", "Uploaded content did not match")
+                PushException.Kind.BRANCH_MOVED -> "branchMoved" to I18n.t("ブランチが更新されたため確認し直しました", "The branch moved, so it was checked again")
+                PushException.Kind.INTEGRITY -> "integrity" to I18n.t("GitHubとの間で内容が一致しませんでした", "Content did not match GitHub")
             }
             is RemoteException -> t.kind.name.lowercase() to remoteMessage(t)
             else -> "error" to (t.message ?: t.javaClass.simpleName)
@@ -217,6 +230,12 @@ class MainActivity : ComponentActivity() {
         val payload = req(reqId).put("message", message).put("kind", kind)
         (t as? PushException)?.report?.let { payload.put("report", PatchJson.check(it)) }
         emit("error", payload)
+    }
+
+    private fun formatMessage(t: PatchFormatException): String = when {
+        t is PatchCountException -> I18n.t("差分の行数がパッチの集計と一致しません", "The diff does not match the patch's own line counts")
+        t.line > 0 -> I18n.t("パッチが壊れています（${t.line}行目）", "The patch is corrupt (line ${t.line})")
+        else -> I18n.t("パッチとして読み込めませんでした", "This is not a patch")
     }
 
     private fun remoteMessage(e: RemoteException): String = when (e.kind) {
@@ -366,6 +385,12 @@ class MainActivity : ComponentActivity() {
 
     private fun webUrl(path: String) = "https://github.com/$path"
 
+    /** The patch to check or push: all of it, or only what 1.0.0 left out of its last push. */
+    private fun patchFor(raw: ByteArray, targetJson: String): PatchSet {
+        val p = PatchParser.parse(raw)
+        return if (JSONObject(targetJson).optBoolean("onlyMissed")) p.droppedBy100() else p
+    }
+
     // ---------------------------------------------------------------- bridge
 
     inner class Bridge {
@@ -435,7 +460,11 @@ class MainActivity : ComponentActivity() {
         fun patch(id: String): String {
             val entry = store.entry(id) ?: return ""
             val raw = store.raw(id) ?: return ""
-            return runCatching { PatchJson.detail(entry, PatchParser.parse(raw)).toString() }.getOrElse { "" }
+            return try {
+                PatchJson.detail(entry, PatchParser.parse(raw)).toString()
+            } catch (e: PatchFormatException) {
+                JSONObject().put("error", formatMessage(e)).toString()
+            }
         }
 
         @JavascriptInterface
@@ -466,23 +495,23 @@ class MainActivity : ComponentActivity() {
         fun check(reqId: String, id: String, targetJson: String) = launch(reqId) {
             val raw = store.raw(id) ?: throw GitHubException(I18n.t("パッチが見つかりません", "The patch is gone"))
             val (repo, t) = target(targetJson)
-            val patch = withContext(Dispatchers.Default) { PatchParser.parse(raw) }
+            val patch = withContext(Dispatchers.Default) { patchFor(raw, targetJson) }
             // Hunk matching is CPU work; the network calls inside switch to IO themselves.
             val report = withContext(Dispatchers.Default) { Pusher(github.remote(repo)).check(patch, t) }
             emit("check", req(reqId).put("report", PatchJson.check(report)))
         }
 
         @JavascriptInterface
-        fun push(reqId: String, id: String, targetJson: String, messagesJson: String, squash: Boolean) =
+        fun push(reqId: String, id: String, targetJson: String, messagesJson: String, squash: Boolean, checkedHead: String) =
             launch(reqId, I18n.t("pushしています", "Pushing")) {
                 val raw = store.raw(id) ?: throw GitHubException(I18n.t("パッチが見つかりません", "The patch is gone"))
                 val (repo, t) = target(targetJson)
                 val messages = runCatching {
                     val a = JSONArray(messagesJson); (0 until a.length()).map { a.optString(it) }
                 }.getOrElse { emptyList() }
-                val patch = withContext(Dispatchers.Default) { PatchParser.parse(raw) }
+                val patch = withContext(Dispatchers.Default) { patchFor(raw, targetJson) }
                 val keepAuthor = store.settings().optBoolean("keepAuthor", true)
-                val r = withContext(Dispatchers.Default) { Pusher(github.remote(repo)).push(patch, t, messages, squash, keepAuthor) }
+                val r = withContext(Dispatchers.Default) { Pusher(github.remote(repo)).push(patch, t, messages, squash, keepAuthor, checkedHead.ifBlank { null }) }
                 val url = when {
                     r.created -> webUrl("$repo/compare/${GitHub.branchPath(r.base ?: "")}...${GitHub.branchPath(r.branch)}?expand=1")
                     r.commits.size == 1 -> webUrl("$repo/commit/${r.head}")
@@ -498,6 +527,7 @@ class MainActivity : ComponentActivity() {
                     .put("url", url)
                     .put("commitUrl", webUrl("$repo/commit/${r.head}"))
                     .put("at", System.currentTimeMillis())
+                    .put("v", BuildConfig.VERSION_NAME)
                 val entry = withContext(Dispatchers.IO) {
                     store.addRecent(repo, r.branch)
                     store.addPush(id, push)

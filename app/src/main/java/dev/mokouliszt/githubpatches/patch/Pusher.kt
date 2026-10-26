@@ -57,7 +57,7 @@ class PushTarget(
 class PushResult(val branch: String, val head: String, val commits: List<String>, val created: Boolean, val base: String?, val parent: String)
 
 class PushException(val kind: Kind, val detail: String, val report: CheckReport? = null) : Exception(detail) {
-    enum class Kind { BRANCH_MISSING, BRANCH_EXISTS, DOES_NOT_APPLY, INTEGRITY }
+    enum class Kind { BRANCH_MISSING, BRANCH_EXISTS, DOES_NOT_APPLY, INTEGRITY, BRANCH_MOVED }
 }
 
 /**
@@ -77,6 +77,8 @@ class Pusher(private val remote: GitRemote) {
     /**
      * @param messages one message per commit (or a single one when [squash])
      * @param keepAuthor keep the patch's author and date (committer is always the signed-in user)
+     * @param checkedHead the tip the user's check ran on. If the branch has moved since and the patch
+     *   no longer applies cleanly there, nothing is pushed and the new report is returned instead.
      */
     suspend fun push(
         patch: PatchSet,
@@ -84,10 +86,11 @@ class Pusher(private val remote: GitRemote) {
         messages: List<String>,
         squash: Boolean,
         keepAuthor: Boolean,
+        checkedHead: String? = null,
     ): PushResult {
         repeat(2) { attempt ->
             try {
-                return pushOnce(patch, target, messages, squash, keepAuthor)
+                return pushOnce(patch, target, messages, squash, keepAuthor, checkedHead)
             } catch (e: RemoteException) {
                 // The branch moved between reading and updating it: build again on the new tip.
                 if (e.kind != RemoteException.Kind.NOT_FAST_FORWARD || attempt == 1 || target.create) throw e
@@ -105,7 +108,7 @@ class Pusher(private val remote: GitRemote) {
     }
 
     private suspend fun pushOnce(
-        patch: PatchSet, target: PushTarget, messages: List<String>, squash: Boolean, keepAuthor: Boolean,
+        patch: PatchSet, target: PushTarget, messages: List<String>, squash: Boolean, keepAuthor: Boolean, checkedHead: String?,
     ): PushResult {
         val head = resolveHead(target)
         var parentTree = remote.commitTree(head)
@@ -114,12 +117,14 @@ class Pusher(private val remote: GitRemote) {
         var parent = head
         val created = ArrayList<String>()
         val failures = ArrayList<FileCheck>()
+        val results = ArrayList<FileCheck>()
 
         for ((g, members) in groups.withIndex()) {
             ws.beginGroup()
             for (ci in members) {
                 for (f in patch.commits[ci].files) {
                     val r = ws.apply(ci, f)
+                    results += r
                     if (r.outcome == Outcome.FAIL) failures += r
                 }
             }
@@ -139,6 +144,10 @@ class Pusher(private val remote: GitRemote) {
             parentTree = tree
         }
 
+        // The user approved a check made on another tip: push only what applies cleanly without asking again.
+        if (checkedHead != null && head != checkedHead && results.any { it.outcome != Outcome.OK }) {
+            throw PushException(PushException.Kind.BRANCH_MOVED, "", CheckReport(head, results))
+        }
         if (target.create) remote.createBranch(target.branch, parent) else remote.updateBranch(target.branch, parent)
         return PushResult(target.branch, parent, created, target.create, target.base, head)
     }
@@ -197,7 +206,11 @@ internal class Workspace(private val remote: GitRemote, private val root: String
 
     private suspend fun content(s: State): ByteArray {
         s.contentOrNull()?.let { return it }
-        val b = blobs[s.sha] ?: remote.blob(s.sha).also { blobs[s.sha] = it }
+        val b = blobs[s.sha] ?: remote.blob(s.sha).also {
+            // Content that changed on the way down would be edited and pushed as if it were the file.
+            if (GitHash.blob(it) != s.sha) throw PushException(PushException.Kind.INTEGRITY, "blob ${s.sha}")
+            blobs[s.sha] = it
+        }
         s.setContent(b)
         return b
     }
@@ -229,6 +242,7 @@ internal class Workspace(private val remote: GitRemote, private val root: String
                     val path = f.newPath!!
                     if (lookup(path) !is Lookup.Missing) return result(Outcome.FAIL, reason = FailReason.EXISTS)
                     val (bytes, o) = produce(null, f)
+                    if (!matchesNewIndex(f, bytes)) return result(Outcome.FAIL, reason = FailReason.CORRUPT)
                     write(path, bytes, normalMode(f.newMode) ?: "100644")
                     result(o)
                 }
@@ -260,6 +274,11 @@ internal class Workspace(private val remote: GitRemote, private val root: String
                         return result(Outcome.OK)
                     }
                     val (bytes, o) = produce(content(cur), f, cur.sha)
+                    // Applied cleanly to the exact file the patch was made from, so the result must be
+                    // the file it was made into. A mismatch means the patch is not what its index line says.
+                    if (o == Outcome.OK && f.oldIndex != null && shaMatches(cur.sha, f.oldIndex) && !matchesNewIndex(f, bytes)) {
+                        return result(Outcome.FAIL, reason = FailReason.CORRUPT)
+                    }
                     if (f.status == FileStatus.RENAMED && to != from) delete(from)
                     write(to, bytes, mode)
                     result(o)
@@ -292,6 +311,11 @@ internal class Workspace(private val remote: GitRemote, private val root: String
             else -> Outcome.OK
         }
         return r.content to o
+    }
+
+    private fun matchesNewIndex(f: FileDiff, bytes: ByteArray): Boolean {
+        val expected = f.newIndex ?: return true
+        return expected.all { it == '0' } || shaMatches(GitHash.blob(bytes), expected)
     }
 
     private fun shaMatches(full: String, abbrev: String): Boolean {
